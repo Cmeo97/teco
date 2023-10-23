@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import numpy as np
+from .transformer import MultiHeadAttention, SinusoidalPositionBiases
 
 
 def constant(value, dtype=jnp.float32):
@@ -76,6 +77,50 @@ class Decoder(nn.Module):
         reconstruction = np.concatenate((ir_bands, vr_bands, wv_bands), axis=-1)
         return reconstruction
 
+
+
+
+class Aggregator(nn.Module):
+    embed_dim: int
+    num_heads: int
+
+    @nn.compact
+    def __call__(self, x):
+        """
+        x: b: Batchsize, l: Sequence length , V: num of modalities (which should be 3) , D: embedding dim
+        """
+
+        b, l, v, d = x.shape
+
+        # Create modalities embedding 
+        modalities_embedding = self.param('modalities_embedding', nn.initializers.normal(stddev=0.02),
+                              [1, 1, 3, self.embed_dim])
+        
+        #add embedding to input x
+        x = x + jnp.tile(modalities_embedding, (b,1,1,1))
+
+        # stack together batch and sequence length dimension
+        x = jnp.reshape(x, (b * l, v, d))
+
+        #define unique query (universal with respect to different modalities, which allows to aggregate them)
+        query = self.param('query', nn.initializers.normal(stddev=0.02),
+                              [1, 1, self.embed_dim])
+        query = jnp.tile(query, (b, 1, 1))
+        
+        # mha step between inputs and queries
+        x = MultiHeadAttention(
+            num_heads=self.num_heads,
+            head_dim=self.embed_dim // self.num_heads,
+            dropout_rate=self.attention_dropout,
+            dtype=self.dtype)(query, x)
+        x = jnp.squeeze(x, axis=1)
+        x = x.reshape((b, l, self.embed_dim))
+
+        # Add positional embedding 
+        position_bias = SinusoidalPositionBiases(dtype=self.dtype)(x)
+        x = x + position_bias
+
+        return x
 
 
 
