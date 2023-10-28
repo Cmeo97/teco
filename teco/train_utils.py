@@ -10,6 +10,7 @@ import optax
 
 class TrainState(train_state.TrainState):
     model_state: Any
+    batch_stats: Any
 
 
 def seed_all(seed):
@@ -64,6 +65,7 @@ def init_model_state(rng_key, model, sample, config):
         **{k: sample[k] for k in config.batch_keys}
     ).unfreeze()
     params = freeze(variables.pop('params'))
+    batch_stats = freeze(variables.pop('batch_stats')) 
     model_state = variables
     print_model_size(params)
 
@@ -73,7 +75,8 @@ def init_model_state(rng_key, model, sample, config):
         apply_fn=model.apply,
         params=params,
         tx=tx,
-        model_state=model_state
+        model_state=model_state,
+        batch_stats=batch_stats
     ), learning_rate_fn
 
 class AverageMeter(object):

@@ -49,6 +49,7 @@ def main():
 
     batch = next(train_loader)
     batch = get_first_device(batch)
+
     model = get_model(config)
     state, schedule_fn = init_model_state(init_rng, model, batch, config)
     if config.ckpt is not None:

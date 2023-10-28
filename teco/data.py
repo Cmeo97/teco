@@ -8,6 +8,10 @@ import tensorflow_datasets as tfds
 import tensorflow_io as tfio
 from tensorflow.python.lib.io import file_io
 import io
+import torch
+
+from teco.w4c_data import RainData
+from teco.w4c_data_utils import load_config
 
 
 def is_tfds_folder(path):
@@ -16,7 +20,62 @@ def is_tfds_folder(path):
         return tf.io.gfile.exists(path)
     else:
         return osp.exists(path)
+    
+class Generator:
 
+    def __init__(self, data, epochs: int, num_samples: int):
+        self.data = data
+        self.epochs = epochs
+        self.num_samples = num_samples
+        if self.num_samples == -1:
+            self.num_samples = len(self.data)
+
+    def data_generator(self):
+        for i in range(self.epochs):
+            ids = np.random.permutation(np.arange(len(self.data)))
+            # shuffle dataset
+            self.data = torch.utils.data.Subset(self.data, ids)
+
+            for j in range(self.num_samples):
+                x, y, z = self.data[j]
+                # Shape of data: (C x T x W x H)
+                # Change the shape to (T x H x W x C)
+                x = np.transpose(x, (1, 3, 2, 0))
+                y = np.transpose(y, (1, 3, 2, 0))
+                x = np.pad(x, ((0, 0), (2, 2), (2, 2), (0, 0)))
+                y = np.pad(y, ((0, 0), (2, 2), (2, 2), (0, 0)))
+                sample = np.vstack((x, y))
+                actions = np.zeros(sample.shape[0]).astype(np.int32)
+
+                yield sample, actions
+
+    def get_dataset(self):
+        dataset = tf.data.Dataset.from_generator(self.data_generator,
+            output_signature=(tf.TensorSpec(shape=(36, 256, 256, 11), dtype=np.float32),
+                tf.TensorSpec(shape=(36), dtype=np.int32)))
+        return dataset
+
+
+def load_weather4cast(config: dict, split: str):
+    """
+    This function returns a Pytorch dataset.
+    """
+    # YAML file specific for loading the Weather4Cast data.
+    dataset_config_path = config.data_configuration_path
+    dataset_config = load_config(dataset_config_path)
+    if split == 'train':
+        dataset = RainData('training', **dataset_config['dataset'])
+    else:
+        dataset = RainData('validation', **dataset_config['dataset'])
+    generator = Generator(dataset, config.epochs, config.num_samples)
+    dataset = generator.get_dataset()
+    dataset = dataset.map(
+        lambda video, actions: dict(video=video, actions=actions),
+        num_parallel_calls=tf.data.experimental.AUTOTUNE
+    )
+    dataset = dataset.batch(config.batch_size, drop_remainder=True)
+    dataset = dataset.prefetch(config.batch_size)
+    return dataset
 
 def load_npz(config, split, num_ds_shards, ds_shard_id):
     folder = osp.join(config.data_path, split, '*', '*.npz')

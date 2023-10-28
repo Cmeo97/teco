@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import numpy as np
-from .transformer import MultiHeadAttention, SinusoidalPositionBiases
+from functools import partial
 
 
 def constant(value, dtype=jnp.float32):
@@ -12,6 +12,24 @@ def constant(value, dtype=jnp.float32):
         dtype = jax.dtypes.canonicalize_dtype(dtype)
         return jnp.full(shape, value, dtype=dtype)
     return init
+
+class MLP(nn.Module):
+    """
+    MLP.
+    The input to the MLP should follow the structure: (N x T x embd_size).
+    The output of the MLP follows the shape: (N x T x C) where C is defined at runtime.
+    """
+    num_neurons: list
+    C: int # the size of the embeddings after the last layer.
+
+    @nn.compact
+    def __call__(self, x):
+        for neurons in self.num_neurons:
+            x = nn.Dense(neurons)(x)
+            x = nn.relu(x)
+        
+        x = nn.Dense(self.C)(x)
+        return x
 
 
 class Encoder(nn.Module):
@@ -25,6 +43,7 @@ class Encoder(nn.Module):
     num_blocks: int
     filters: list
     embeddings: int
+    num_embeddings: int
 
     @nn.compact
     def __call__(self, x, train: bool):
@@ -36,22 +55,32 @@ class Encoder(nn.Module):
         # water vapor
         wv_input = x[:, :, :, :, 9:].reshape(-1, x.shape[2], x.shape[3], 2)
 
-        ir_embeddings = EncoderHead(num_blocks=self.num_blocks, filters=self.filters, embeddings=self.embeddings)(ir_input, train)
-        vr_embeddings = EncoderHead(num_blocks=self.num_blocks, filters=self.filters, embeddings=self.embeddings)(vr_input, train)
-        wv_embeddings = EncoderHead(num_blocks=self.num_blocks, filters=self.filters, embeddings=self.embeddings)(wv_input, train)
+        ir = EncoderHead(num_blocks=self.num_blocks, filters=self.filters, embeddings=self.embeddings,
+                num_embeddings=self.num_embeddings)(ir_input, train)
+        vr = EncoderHead(num_blocks=self.num_blocks, filters=self.filters, embeddings=self.embeddings,
+                num_embeddings=self.num_embeddings)(vr_input, train)
+        wv = EncoderHead(num_blocks=self.num_blocks, filters=self.filters, embeddings=self.embeddings,
+                num_embeddings=self.num_embeddings)(wv_input, train)
 
         # Concatenate embeddings.
-        print(ir_embeddings.shape)
-        embeddings = np.concatenate((ir_embeddings, vr_embeddings, wv_embeddings), axis=1)
-        print(embeddings.shape)
+        embeddings = jnp.concatenate((ir['embeddings'], vr['embeddings'], wv['embeddings']), axis=1)
         # Bring back time dimension.
         embeddings = embeddings.reshape(x.shape[0], x.shape[1], 3, self.embeddings)
-        return embeddings
+
+        # Accumulate losses over the heads.
+        acc_losses = dict(commitment_loss=(ir['commitment_loss'] + vr['commitment_loss'] + wv['commitment_loss']),
+                codebook_loss=(ir['codebook_loss'] + vr['codebook_loss'] + wv['codebook_loss']),
+                perplexity=(ir['perplexity'] + vr['perplexity'] + wv['perplexity']),
+                ir_commitment_loss=ir['commitment_loss'], vr_commitment_loss=vr['commitment_loss'],
+                wv_commitment_loss=wv['commitment_loss'], ir_codebook_loss=ir['codebook_loss'],
+                vr_codebook_loss=vr['codebook_loss'], wv_codebook_loss=wv['codebook_loss'],
+                ir_perplexity=ir['perplexity'], vr_perplexity=vr['perplexity'], wv_perplexity=wv['perplexity'])
+        return embeddings, acc_losses
 
 class Decoder(nn.Module):
     """
     Decoder of the TECO embeddings from Weather4Cast competition.
-    The input to the decoder should follow the structure: (N x T x embd)
+    The input to the decoder should follow the structure: (N x T x 3 x embd)
     The batch and time dimensions are collapsed into one.
     The output of the decoder follows the shape: ((N x T) x H x W x C).
     """
@@ -63,18 +92,18 @@ class Decoder(nn.Module):
     @nn.compact
     def __call__(self, x, train: bool):
         # Collapse the first 2 dims.
-        x = x.reshape(-1, x.shape[2])
+        x = x.reshape(-1, x.shape[2], x.shape[3])
 
         ir_bands = DecoderHead(channels=7, num_blocks=self.num_blocks, filters=self.filters, embeddings=self.embeddings,
-                shape=self.shape)(x, train)
+                shape=self.shape)(x[:, 0, :], train)
         vr_bands = DecoderHead(channels=2, num_blocks=self.num_blocks, filters=self.filters, embeddings=self.embeddings,
-                shape=self.shape)(x, train)
+                shape=self.shape)(x[:, 1, :], train)
         wv_bands = DecoderHead(channels=2, num_blocks=self.num_blocks, filters=self.filters, embeddings=self.embeddings,
-                shape=self.shape)(x, train)
+                shape=self.shape)(x[:, 2, :], train)
 
         # Concatenate the channels.
 
-        reconstruction = np.concatenate((ir_bands, vr_bands, wv_bands), axis=-1)
+        reconstruction = jnp.concatenate((ir_bands, vr_bands, wv_bands), axis=-1)
         return reconstruction
 
 
@@ -83,6 +112,8 @@ class Decoder(nn.Module):
 class Aggregator(nn.Module):
     embed_dim: int
     num_heads: int
+    dtype: jnp.dtype = jnp.float32
+
 
     @nn.compact
     def __call__(self, x):
@@ -104,14 +135,14 @@ class Aggregator(nn.Module):
 
         #define unique query (universal with respect to different modalities, which allows to aggregate them)
         query = self.param('query', nn.initializers.normal(stddev=0.02),
-                              [1, 1, self.embed_dim])
-        query = jnp.tile(query, (b, 1, 1))
+                             [1, 1, self.embed_dim])
+        query = jnp.tile(query, (b * l, 1, 1))
         
         # mha step between inputs and queries
         x = MultiHeadAttention(
             num_heads=self.num_heads,
             head_dim=self.embed_dim // self.num_heads,
-            dropout_rate=self.attention_dropout,
+            dropout_rate=0.1,
             dtype=self.dtype)(query, x)
         x = jnp.squeeze(x, axis=1)
         x = x.reshape((b, l, self.embed_dim))
@@ -120,6 +151,38 @@ class Aggregator(nn.Module):
         position_bias = SinusoidalPositionBiases(dtype=self.dtype)(x)
         x = x + position_bias
 
+        return x, query
+    
+
+class Deaggregator(nn.Module):
+    embed_dim: int
+    num_heads: int
+    dtype: jnp.dtype = jnp.float32
+
+
+    @nn.compact
+    def __call__(self, x, query):
+        """
+        x: b: Batchsize, l: Sequence length , D: embedding dim
+        query: the query from the aggregator.
+        """
+
+        b, l, d = x.shape
+
+        # stack together batch and sequence length dimension
+        x = jnp.reshape(x, (b * l, 1, d))
+        # copy the embeddings three times
+        x = jnp.concatenate((x, x, x), axis=1)
+
+        # mha step between inputs and queries
+        x = MultiHeadAttention(
+            num_heads=self.num_heads,
+            head_dim=self.embed_dim // self.num_heads,
+            dropout_rate=0.1,
+            dtype=self.dtype)(x, query)
+        
+        x = x.reshape((b, l, 3, d))
+        
         return x
 
 
@@ -127,11 +190,12 @@ class Aggregator(nn.Module):
 class EncoderHead(nn.Module):
     """
     Encoder head from specific bands.
-    Composed of multiple EncoderHead blocks and a projection layer
+    Composed of multiple EncoderHead blocks + projection layer + Codebook used for quantization.
     """
     num_blocks: int
     filters: list
     embeddings: int
+    num_embeddings: int # size of the codebook
 
     @nn.compact
     def __call__(self, x, train: bool):
@@ -142,9 +206,10 @@ class EncoderHead(nn.Module):
         x = x.reshape(x.shape[0], -1)
         # projection layer to the embeddings dimensions
         x = nn.Dense(self.embeddings)(x)
-        x = nn.relu(x)
+        # quantize the embeddings
+        codebook_lookups = Codebook(n_codes=self.num_embeddings, proj_dim=self.embeddings, embedding_dim=self.embeddings)(x, None)
 
-        return x
+        return codebook_lookups
 
 class DecoderHead(nn.Module):
     """
@@ -287,7 +352,6 @@ class ResNetBlock(nn.Module):
         x = AddBias(dtype=self.dtype)(x)
         return skip + 0.1 * x 
 
-
 class Codebook(nn.Module):
     n_codes: int
     proj_dim: int
@@ -352,3 +416,71 @@ class AddBias(nn.Module):
 def normalize(x):
     x = x / jnp.clip(jnp.linalg.norm(x, axis=-1, keepdims=True), a_min=1e-6, a_max=None)
     return x
+
+class MultiHeadAttention(nn.Module):
+    num_heads: int
+    head_dim: int
+    dtype: Any = jnp.float32
+    dropout_rate: float = 0.
+    kernel_init: Any = nn.initializers.variance_scaling(1.0, 'fan_in', 'normal')
+
+    @nn.compact
+    def __call__(self, inputs_q, inputs_kv, mask=None, deterministic=False):
+        projection = partial(
+            nn.DenseGeneral,
+            axis=-1,
+            features=(self.num_heads, self.head_dim),
+            dtype=self.dtype
+        )
+
+        query = projection(kernel_init=self.kernel_init, name='query')(inputs_q)
+        key = projection(kernel_init=self.kernel_init, name='key')(inputs_kv)
+        value = projection(kernel_init=self.kernel_init, name='value')(inputs_kv)
+
+        if mask is not None:
+            attention_bias = jax.lax.select(
+                mask > 0,
+                jnp.full(mask.shape, 0.).astype(self.dtype),
+                jnp.full(mask.shape, -1e10).astype(self.dtype)
+            )
+        else:
+            attention_bias = None
+        
+        dropout_rng = None
+        if not deterministic and self.dropout_rate > 0.:
+            dropout_rng = self.make_rng('dropout')
+
+        x = nn.attention.dot_product_attention(
+            query, key, value, bias=attention_bias,
+            dropout_rng=dropout_rng, dropout_rate=self.dropout_rate,
+            deterministic=deterministic, dtype=self.dtype
+        )
+        out = nn.DenseGeneral(
+            features=inputs_q.shape[-1],
+            axis=(-2, -1),
+            kernel_init=self.kernel_init,
+            dtype=self.dtype,
+            use_bias=False,
+            name='out'
+        )(x)
+        out = AddBias(name='out_bias')(out)
+
+        return out
+
+class SinusoidalPositionBiases(nn.Module):
+    shape: Optional[Tuple[int]] = None
+    dtype: Any = jnp.float32
+
+    @nn.compact
+    def __call__(self, x):
+        embed_dim = x.shape[-1]
+        length = np.prod(self.shape or x.shape[1:-1])
+        pos_seq = jnp.arange(length, dtype=self.dtype)
+
+        inv_freq = jnp.arange(0.0, embed_dim, 2.0) / embed_dim
+        inv_freq = 1. / (10000 ** inv_freq)
+        inv_freq = jnp.asarray(inv_freq, self.dtype)
+
+        sinusoid_inp = jnp.outer(pos_seq, inv_freq)
+        position_bias = jnp.concatenate([jnp.sin(sinusoid_inp), jnp.cos(sinusoid_inp)], axis=-1)
+        return position_bias

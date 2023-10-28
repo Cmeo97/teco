@@ -5,6 +5,8 @@ from .vqgan import VQGAN
 from .vae import VAE
 from .teco import TECO
 from .xmap.teco import TECOShard
+from .multiheadvq import MultiHeadVQ
+from teco.w4c_data_utils import load_config
 
 
 def load_vqvae(ckpt_path, need_encode=True):
@@ -67,6 +69,7 @@ def load_ckpt(ckpt_path, replicate=True, return_config=False,
         return model, state
 
 
+
 def get_model(config, need_encode=None, xmap=False, **kwargs):
     if config.model == 'teco':
         if need_encode is None:
@@ -80,6 +83,10 @@ def get_model(config, need_encode=None, xmap=False, **kwargs):
         model = VQGAN(config, **kwargs)
     elif config.model == 'autoencoder':
         model = VAE(config, **kwargs)
+    elif config.model == 'multiheadvq':
+        # TODO: load the proper config
+        model_config = load_config(config.model_configuration_path)
+        model = MultiHeadVQ(model_config)
     elif config.model == 'teco':
         model = TECO(config, **kwargs)
         if xmap:
