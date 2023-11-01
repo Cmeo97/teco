@@ -2,23 +2,24 @@ seed: 1
 cache: false # caching available only for encoded datasets
 
 # Training
-batch_size: 8
+batch_size: 4
 num_workers: 4
 lr: 0.0001
 lr_schedule: "cosine"
 weight_decay: 0.00001
 total_steps: 1000000
 warmup_steps: 5000
-save_interval: 5
+save_interval: 1000
 viz_interval: 100000
-log_interval: 1
+log_interval: 50
 epochs: 500
 num_samples: -1
+validation_it: 50
 
 # Data
 data_path: "/mnt/nvme/home/weather4cast/Dataset"
 # path to model configuration
-model_configuration_path: "/users/mlica/research/teco/configs/vq/multiheadvq.yaml"
+model_configuration_path: "/users/mlica/research/teco/configs/vq/oneheadencdec.yaml"
 data_configuration_path: "/users/mlica/research/teco/configs/data/weather4cast.yaml"
 eval_seq_len: 36
 seq_len: 36
@@ -30,4 +31,4 @@ rng_keys: ["dropout"]
 batch_keys: ["video"]
 
 # Model
-model: "multiheadvq"
+model: "encdec"

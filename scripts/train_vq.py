@@ -21,6 +21,8 @@ from teco.train_utils import init_model_state, \
 from teco.utils import flatten, add_border, save_video_grid
 from teco.models import get_model, sample
 from teco.data import load_weather4cast
+from teco.w4c_data_utils import load_config
+from teco.models.onehead import OneHeadEncDec
 
 
 def main():
@@ -41,8 +43,8 @@ def main():
         os.makedirs(osp.join(root_dir, 'wandb'), exist_ok=True)
 
         wandb.init(project='teco', config=config,
-                   dir=root_dir, id='beta-multiheadvq')
-        wandb.run.name = 'beta-multiheadvq'
+                   dir=root_dir, id='gamma-encdec')
+        wandb.run.name = 'gamma-encdec'
         wandb.run.save()
 
     #data = Data(config)
@@ -52,22 +54,29 @@ def main():
     train_data = load_weather4cast(config, 'train')
     test_data = load_weather4cast(config, 'validation')
 
-    num_data_local = 4 # number of GPUs used
+    num_data_local = jax.local_device_count() # number of GPUs used (has to be divisible by the batch size)
     def prepare_tf_data(xs):
             def _prepare(x):
+                if x == None:
+                    return None
                 x = x._numpy()
                 x = x.reshape((num_data_local, -1) + x.shape[1:])
                 return x
             xs = jax.tree_util.tree_map(_prepare, xs)
             return xs
 
+    # train
     iterator = map(prepare_tf_data, train_data)
     iterator = jax_utils.prefetch_to_device(iterator, 2)
     train_loader = iterator
+    # validation
+    iterator = map(prepare_tf_data, test_data)
+    iterator = jax_utils.prefetch_to_device(iterator, 2)
+    test_loader = iterator
     batch = next(train_loader)
     batch = get_first_device(batch)
     model = get_model(config)
-    state, schedule_fn = init_model_state(init_rng, model, batch, config)
+    state, schedule_fn = init_model_state(init_rng, model, batch, config, train_flag=True)
     if config.ckpt is not None:
         state = checkpoints.restore_checkpoint(osp.join(config.ckpt, 'checkpoints'), state)
         print('Restored from checkpoint')
@@ -80,7 +89,7 @@ def main():
     rngs = random.split(rng, jax.local_device_count())
     while iteration <= config.total_steps:
         iteration, state, rngs = train(iteration, model, state, train_loader,
-                                       schedule_fn, rngs)
+                                       test_loader, schedule_fn, rngs)
         if iteration % config.save_interval == 0:
             if is_master_process:
                 state_ = jax_utils.unreplicate(state)
@@ -94,10 +103,11 @@ def train_step(batch, state, rng):
     new_rng, *rngs = random.split(rng, len(config.rng_keys) + 1)
     rngs = {k: r for k, r in zip(config.rng_keys, rngs)}
     def loss_fn(params):
-        variables = {'params': params, **state.model_state}
+        variables = {'params': params, 'batch_stats': state.batch_stats}
         out, updates = state.apply_fn(
             variables,
             video=batch['video'],
+            train=True,
             rngs=rngs,
             mutable=['batch_stats']
         )
@@ -113,25 +123,47 @@ def train_step(batch, state, rng):
         loss_fn, has_aux=True)(state.params)
     out = aux[1][0]
     grads = jax.lax.pmean(grads, axis_name='batch')
-    new_state = state.apply_gradients(
+    state = state.apply_gradients(
         grads=grads,
     )
     # apply batch stats
-    new_state = new_state.replace(batch_stats=aux[1][1])
+    state = state.replace(batch_stats=aux[1][1]['batch_stats'])
 
-    return new_state, out, new_rng
+    return state, out, new_rng
+
+def eval_step(batch, state, rng):
+    new_rng, *rngs = random.split(rng, len(config.rng_keys) + 1)
+    rngs = {k: r for k, r in zip(config.rng_keys, rngs)}
+    variables = {'params': state.params, 'batch_stats': state.batch_stats.unfreeze()}
+    out = state.apply_fn(
+        variables,
+        video=batch['video'],
+        train=False,
+        rngs=rngs,
+    )
+
+    recon_loss = optax.squared_error(out['out'], batch['video']).mean()
+    loss = recon_loss + out['codebook_loss'] + out['commitment_loss']
+    out['recon_loss'] = recon_loss
+    out['loss'] = loss
+
+    return state, out, new_rng
 
 
-
-def train(iteration, model, state, train_loader, schedule_fn, rngs):
+def train(iteration, model, state, train_loader, test_loader, schedule_fn, rngs):
     progress = ProgressMeter(
         config.total_steps,
         ['time', 'data'] + model.metrics
     )
 
     p_train_step = jax.pmap(train_step, axis_name='batch')
+    p_eval_step = jax.pmap(eval_step, axis_name='batch')
 
+    # Load model configuration.
+    model_config = load_config(config.model_configuration_path)
     end = time.time()
+    metrics = {k: jnp.array([0]) for k in model.metrics}
+    metrics = {k: v.astype(jnp.float32) for k, v in metrics.items()}
     while True:
         batch = next(train_loader)
         batch_size = batch['video'].shape[1]
@@ -139,20 +171,68 @@ def train(iteration, model, state, train_loader, schedule_fn, rngs):
 
         state, return_dict, rngs = p_train_step(batch=batch, state=state, rng=rngs)
 
-        metrics = {k: return_dict[k].mean() for k in model.metrics}
+        if isinstance(model, OneHeadEncDec):
+            return_dict['usage'] = np.array([len(np.unique(return_dict['usage'])) / model_config['n_codes']]) 
+        else:
+            # The percentage usage is average over all samples in a batch
+            return_dict['ir_usage'] = np.array([len(np.unique(return_dict['ir_usage'])) / model_config['num_embeddings_enc']])
+            return_dict['vr_usage'] = np.array([len(np.unique(return_dict['vr_usage'])) / model_config['num_embeddings_enc']])
+            return_dict['wv_usage'] = np.array([len(np.unique(return_dict['wv_usage'])) / model_config['num_embeddings_enc']])
+
+        metrics = {k: return_dict[k].mean() + metrics[k] for k in model.metrics}
         metrics = {k: v.astype(jnp.float32) for k, v in metrics.items()}
         progress.update(n=batch_size, **{k: v for k, v in metrics.items()})
 
         if is_master_process and iteration % config.log_interval == 0:
+            # Average over iterations.
+            if iteration == 0:
+                metrics = {k: metrics[k] for k in model.metrics} 
+            else:
+                metrics = {k: metrics[k] / config.log_interval for k in model.metrics} 
+
             wandb.log({**{f'train/{metric}': val
                         for metric, val in metrics.items()}
                     }, step=iteration)
+
+            # Reset metrics after logging.            
+            metrics = {k: jnp.array([0]) for k in model.metrics}
+            metrics = {k: v.astype(jnp.float32) for k, v in metrics.items()} 
+            
+            # VALIDATION
+            val_metrics = {k: jnp.array([0]) for k in model.metrics}
+            val_metrics = {k: v.astype(jnp.float32) for k, v in val_metrics.items()}
+            val_iterations = 0
+            eval_batch = next(test_loader)
+            iterations = 1 if iteration == 0 else config.log_interval
+            for _ in range(iterations): # NOTE: use the same number of iterations for validation as for training.
+                batch_size = eval_batch['video'].shape[1]
+
+                state, return_dict, rngs = p_eval_step(batch=eval_batch, state=state, rng=rngs)
+                if isinstance(model, OneHeadEncDec):
+                    return_dict['usage'] = np.array([len(np.unique(return_dict['usage'])) / model_config['n_codes']]) 
+                else:
+                    # The percentage usage is average over all samples in a batch
+                    return_dict['ir_usage'] = np.array([len(np.unique(return_dict['ir_usage'])) / model_config['num_embeddings_enc']])
+                    return_dict['vr_usage'] = np.array([len(np.unique(return_dict['vr_usage'])) / model_config['num_embeddings_enc']])
+                    return_dict['wv_usage'] = np.array([len(np.unique(return_dict['wv_usage'])) / model_config['num_embeddings_enc']])
+                val_metrics = {k: (return_dict[k].mean() + val_metrics[k]) for k in model.metrics}
+                val_iterations += 1
+                eval_batch = next(test_loader)
+
+            val_metrics = {k: val_metrics[k] / val_iterations for k in model.metrics}
+            print(val_metrics, val_iterations)
+            # LOG VALIDATION
+            wandb.log({**{f'val/{metric}': val
+                        for metric, val in val_metrics.items()}
+                    }, step=iteration)
+
 
         progress.update(time=time.time() - end)
         end = time.time()
 
         if iteration % config.log_interval == 0:
-            progress.display(iteration)
+            #progress.display(iteration)
+            print(f'Logged iteration {iteration}')
 
         if iteration % config.save_interval == 0 or \
         iteration % config.viz_interval == 0 or \

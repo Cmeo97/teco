@@ -1,7 +1,43 @@
 import flax.linen as nn
 import jax.numpy as jnp
+import numpy as np
 
-from .base import Encoder, Aggregator, MLP, Codebook, Decoder, Deaggregator
+from .base import Encoder, Aggregator, MLP, Codebook, Decoder, Deaggregator, EncoderHead
+
+class VQMultiHeadEncDec(nn.Module):
+    """
+    Encoder-Decoder part of the MultiHead VQ-VAE.
+    """
+    config: dict
+
+    @property
+    def metrics(self):
+        metrics = ['loss', 'recon_loss', 'codebook_loss', 
+                   'commitment_loss', 'perplexity', 'ir_commitment_loss', 'vr_commitment_loss', 'wv_commitment_loss',
+                   'ir_codebook_loss', 'vr_codebook_loss', 'wv_codebook_loss',
+                   'ir_perplexity', 'wv_perplexity', 'vr_perplexity',
+                   'ir_usage', 'vr_usage', 'wv_usage']
+        return metrics
+    
+    @nn.compact
+    def __call__(self, video, train: bool):
+        x = video
+        b, t, h, w, c = x.shape
+        # Encoder
+        x, losses, usages = Encoder(num_blocks=self.config['num_blocks_enc'], filters=self.config['filters_enc'],
+                             embeddings=self.config['embeddings_enc'], num_embeddings=self.config['num_embeddings_enc'])(x, train)
+       
+        # Decoder
+        x = Decoder(num_blocks=self.config['num_blocks_dec'], filters=self.config['filters_dec'],
+                    embeddings=self.config['embeddings_enc'], shape=(b * t, 8, 8, self.config['filters_enc'][-1]))(x, train)
+        
+        x = x.reshape((b, t, h, w, c))
+        return_dict = losses
+        return_dict['out'] = x
+        return_dict.update(usages)
+
+        return return_dict
+    
 
 class MultiHeadVQ(nn.Module):
     """
@@ -20,7 +56,7 @@ class MultiHeadVQ(nn.Module):
         return metrics
 
     @nn.compact
-    def __call__(self, video, train: bool = True):
+    def __call__(self, video, train: bool):
 
         x = video 
         b, t, h, w, c = x.shape
@@ -48,8 +84,10 @@ class MultiHeadVQ(nn.Module):
         losses['codebook_codebook_loss'] = codebook_dict['codebook_loss']
         losses['codebook_perplexity'] = codebook_dict['perplexity']
 
-        # TODO: add logging
-        # TODO: mse losses for the single heads
+        # NOTE: check usage of the codebook
+        #usage = dict()
+        #usage['codebook_usage'] = len(np.unique(codebook_dict['encodings'])) / self.config['n_codes']
+
         # free up space
         del codebook_dict
 
@@ -68,6 +106,7 @@ class MultiHeadVQ(nn.Module):
         x = x.reshape((b, t, h, w, c))
         return_dict = losses
         return_dict['out'] = x
+        #return_dict.update(usage)
         return return_dict
 
         

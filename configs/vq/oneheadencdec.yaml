@@ -1,0 +1,12 @@
+# MODEL CONFIGURATION FOR OneHeadEncDec
+
+num_blocks_enc: 5
+filters_enc: [32, 64, 128, 256, 512]
+filters_dec: [32, 64, 128, 256, 512] # should be the same as filters_enc
+embeddings_enc: 256
+num_embeddings_enc: 256
+num_heads_agg: 16
+mlp_layers: [256, 256, 256]
+codebook_embd: 256
+n_codes: 256
+num_blocks_dec: 5

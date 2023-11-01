@@ -5,7 +5,8 @@ from .vqgan import VQGAN
 from .vae import VAE
 from .teco import TECO
 from .xmap.teco import TECOShard
-from .multiheadvq import MultiHeadVQ
+from .multiheadvq import MultiHeadVQ, VQMultiHeadEncDec
+from .onehead import OneHeadEncDec
 from teco.w4c_data_utils import load_config
 
 
@@ -87,6 +88,12 @@ def get_model(config, need_encode=None, xmap=False, **kwargs):
         # TODO: load the proper config
         model_config = load_config(config.model_configuration_path)
         model = MultiHeadVQ(model_config)
+    elif config.model == 'encdec':
+        model_config = load_config(config.model_configuration_path)
+        model = VQMultiHeadEncDec(model_config)
+    elif config.model == 'oneheadencdec':
+        model_config = load_config(config.model_configuration_path)
+        model = OneHeadEncDec(model_config)
     elif config.model == 'teco':
         model = TECO(config, **kwargs)
         if xmap:

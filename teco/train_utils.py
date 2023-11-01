@@ -59,13 +59,23 @@ def get_optimizer(config):
     return tx, learning_rate_fn
 
 
-def init_model_state(rng_key, model, sample, config):
-    variables = model.init(
-        rngs={k: rng_key for k in ['params', *config.rng_keys]},
-        **{k: sample[k] for k in config.batch_keys}
-    ).unfreeze()
-    params = freeze(variables.pop('params'))
-    batch_stats = freeze(variables.pop('batch_stats')) 
+def init_model_state(rng_key, model, sample, config, train_flag: bool = False):
+    # add a training flag as an argument to the model __call__ function. This is used to take in consideration the
+    # batch normalization.
+    if train_flag:
+        config.train = True
+        variables = model.init(
+            rngs={k: rng_key for k in ['params', *config.rng_keys]},
+            **{**{k: sample[k] for k in config.batch_keys}, **{'train': False}}
+        )
+    else:
+        variables = model.init(
+            rngs={k: rng_key for k in ['params', *config.rng_keys]},
+            **{k: sample[k] for k in config.batch_keys}
+        )
+ 
+    params = variables['params'].unfreeze()
+    batch_stats = variables['batch_stats'].unfreeze()
     model_state = variables
     print_model_size(params)
 

@@ -31,6 +31,27 @@ class MLP(nn.Module):
         x = nn.Dense(self.C)(x)
         return x
 
+class OneHeadEncoder(nn.Module):
+    """
+    Encoder of the input data from Weather4cast competition.
+    The input to the encoder should follow the structure: (N x T x H x W x C).
+    The batch and time dimensions are collapsed into one.
+    The output of the encoder follows the shape: (N x T x embd_size).
+    """
+    num_blocks: int
+    filters: list
+    embeddings: int
+
+    @nn.compact
+    def __call__(self, x, train: bool):
+        b, t, h, w, c = x.shape
+        # Collapse time
+        x = x.reshape(-1, h, w, c)
+        # NOTE: Assume the input sequence follows the channel structure in the weather4cast repository.
+        x = EncoderHead(num_blocks=self.num_blocks, filters=self.filters, embeddings=self.embeddings)(x, train)
+        # Bring back time dimension.
+        embeddings = x.reshape(b, t, self.embeddings)
+        return embeddings
 
 class Encoder(nn.Module):
     """
@@ -55,11 +76,11 @@ class Encoder(nn.Module):
         # water vapor
         wv_input = x[:, :, :, :, 9:].reshape(-1, x.shape[2], x.shape[3], 2)
 
-        ir = EncoderHead(num_blocks=self.num_blocks, filters=self.filters, embeddings=self.embeddings,
+        ir = VQEncoderHead(num_blocks=self.num_blocks, filters=self.filters, embeddings=self.embeddings,
                 num_embeddings=self.num_embeddings)(ir_input, train)
-        vr = EncoderHead(num_blocks=self.num_blocks, filters=self.filters, embeddings=self.embeddings,
+        vr = VQEncoderHead(num_blocks=self.num_blocks, filters=self.filters, embeddings=self.embeddings,
                 num_embeddings=self.num_embeddings)(vr_input, train)
-        wv = EncoderHead(num_blocks=self.num_blocks, filters=self.filters, embeddings=self.embeddings,
+        wv = VQEncoderHead(num_blocks=self.num_blocks, filters=self.filters, embeddings=self.embeddings,
                 num_embeddings=self.num_embeddings)(wv_input, train)
 
         # Concatenate embeddings.
@@ -75,7 +96,32 @@ class Encoder(nn.Module):
                 wv_commitment_loss=wv['commitment_loss'], ir_codebook_loss=ir['codebook_loss'],
                 vr_codebook_loss=vr['codebook_loss'], wv_codebook_loss=wv['codebook_loss'],
                 ir_perplexity=ir['perplexity'], vr_perplexity=vr['perplexity'], wv_perplexity=wv['perplexity'])
-        return embeddings, acc_losses
+        
+        # Keep track of codebook indices used.
+        inds = dict(ir_usage=ir['encodings'], vr_usage=vr['encodings'], wv_usage=wv['encodings'])
+        #acc_losses.update(usage)
+        return embeddings, acc_losses, inds
+    
+class OneHeadDecoder(nn.Module):
+    """
+    Decoder of the TECO embeddings from Weather4Cast competition.
+    The input to the decoder should follow the structure: (N x T x embd)
+    The batch and time dimensions are collapsed into one.
+    The output of the decoder follows the shape: ((N x T) x H x W x C).
+    """
+    num_blocks: int
+    filters: int
+    embeddings: int
+    shape: tuple
+
+    @nn.compact
+    def __call__(self, x, train: bool):
+        # Collapse the first 2 dims.
+        x = x.reshape(-1, x.shape[2])
+
+        x = DecoderHead(channels=11, num_blocks=self.num_blocks, filters=self.filters, embeddings=self.embeddings,
+                shape=self.shape)(x, train)
+        return x
 
 class Decoder(nn.Module):
     """
@@ -187,7 +233,7 @@ class Deaggregator(nn.Module):
 
 
 
-class EncoderHead(nn.Module):
+class VQEncoderHead(nn.Module):
     """
     Encoder head from specific bands.
     Composed of multiple EncoderHead blocks + projection layer + Codebook used for quantization.
@@ -210,6 +256,27 @@ class EncoderHead(nn.Module):
         codebook_lookups = Codebook(n_codes=self.num_embeddings, proj_dim=self.embeddings, embedding_dim=self.embeddings)(x, None)
 
         return codebook_lookups
+    
+
+class EncoderHead(nn.Module):
+    """
+    Encoder head for all bands.
+    Composed of multiple EncoderHead blocks + projection layer.
+    """
+    num_blocks: int
+    filters: list
+    embeddings: int
+
+    @nn.compact
+    def __call__(self, x, train: bool):
+        for i in range(self.num_blocks):
+            x = HeadBlock(self.filters[i])(x, train)
+
+        # flatten input
+        x = x.reshape(x.shape[0], -1)
+        # projection layer to the embeddings dimensions
+        x = nn.Dense(self.embeddings)(x)
+        return x
 
 class DecoderHead(nn.Module):
     """
@@ -234,7 +301,6 @@ class DecoderHead(nn.Module):
                                  "bilinear")
 
         x = nn.Conv(self.channels, (3, 3))(x)
-        x = nn.relu(x)
         return x
 
 

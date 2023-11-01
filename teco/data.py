@@ -23,15 +23,17 @@ def is_tfds_folder(path):
     
 class Generator:
 
-    def __init__(self, data, epochs: int, num_samples: int):
+    def __init__(self, data, epochs: int, num_samples: int, mode: str):
         self.data = data
         self.epochs = epochs
         self.num_samples = num_samples
+        self.mode = mode
         if self.num_samples == -1:
             self.num_samples = len(self.data)
 
     def data_generator(self):
-        for i in range(self.epochs):
+        # NOTE: Use this instead the number of epochs as the repo setup already has a way to control training length
+        while True:
             ids = np.random.permutation(np.arange(len(self.data)))
             # shuffle dataset
             self.data = torch.utils.data.Subset(self.data, ids)
@@ -48,6 +50,7 @@ class Generator:
                 actions = np.zeros(sample.shape[0]).astype(np.int32)
 
                 yield sample, actions
+
 
     def get_dataset(self):
         dataset = tf.data.Dataset.from_generator(self.data_generator,
@@ -67,7 +70,7 @@ def load_weather4cast(config: dict, split: str):
         dataset = RainData('training', **dataset_config['dataset'])
     else:
         dataset = RainData('validation', **dataset_config['dataset'])
-    generator = Generator(dataset, config.epochs, config.num_samples)
+    generator = Generator(dataset, config.epochs, config.num_samples, split)
     dataset = generator.get_dataset()
     dataset = dataset.map(
         lambda video, actions: dict(video=video, actions=actions),
